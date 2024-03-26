@@ -95,4 +95,65 @@ async fn main() {
         };
         events.lock().await.push(message.data);
     });
+
+    let _= tokio::spawn({
+        let order_book = order_book.clone();
+        let events = events.clone();
+
+        println!("Bootstrapping order book...");
+
+        async move {
+            loop {
+                std::thread::sleep(std::time::Duration::from_secs(2));
+
+                let Some(last_ws_update_id) = events
+                    .lock()
+                    .await
+                    .first()
+                    .map(|event| event.last_update_id)
+                 else {
+
+                    continue;
+                };
+
+                let Ok(request) = request::get(format!("")).await
+                else {
+                    println!("Error fetching order book snapshot");
+                    continue;
+                };
+                let Ok(Snapshot) = request.json::<OrderbookSnapshot>().await else {
+                    println!("Error parsing order book snapshot");
+                    continue;
+                };
+                let Ok(snapshot_last_update_id) = snapshot.last_update_id.parse::<u64>() else {
+                    println!("Error parsing order book snapshot last update id");
+                    continue;
+                };
+
+
+                if snapshot_last_update_id >= last_ws_update_id {
+                    events 
+                      .lock()
+                      .await
+                      .retain(|event| event.last_update_id > snapshot_last_update_id);
+                    *order_book.lock().await =Orderbook {
+                       asks: Snapshot
+                          .asks
+                          .into.iter()
+                          .map(|(price, quantity)| (price, quantity))
+                          .collect(),
+                       bids: snapshot
+                           .bids
+                           .into_iter()
+                           .map(|(price, quantity)|(price, quantity))
+                           .collect(),
+                        last_update_id: snapshot_last_update_id;
+                    };
+                    break;
+                }
+            }
+
+
+        }
+    })
 }
