@@ -1,68 +1,60 @@
-use crossterm::terminal::ClearType;
-use crossterm::terminate::Clear;
 use crossterm::{
     execute,
     style::{Color, Print, SetForegroundColor},
+    terminal::{Clear, ClearType},
 };
-use futures::{SkinExt, StreamExt};
+use futures::{SinkExt, StreamExt};
 use rust_decimal::Decimal;
-use serde::Derserialize;
-use serde::Serialize;
-use std::collection::BtreeMap;
+use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::io::stdout;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::protocol::Message;
+use reqwest;
 
-const API_BASE: &str = "";
-const WSS_URL: &str = "";
-const SYMBOL: &str = "";
+const API_BASE: &str = "https://api.example.com";
+const WSS_URL: &str = "wss://stream.example.com/ws";
+const SYMBOL: &str = "btcusdt";
 
 type Price = Decimal;
 type Quantity = Decimal;
 
 #[derive(Debug, Deserialize)]
 pub struct OrderBook {
-    pub asks: BTreeMap<Decimal, Decimal>,
-    pub bids: BTreeMap<Decimal, Deciaml>,
+    pub asks: BTreeMap<Price, Quantity>,
+    pub bids: BTreeMap<Price, Quantity>,
     pub last_update_id: u64,
 }
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct OrderBookSnapshot {
-    pub asks: Vec<(Decimal, Decimal)>,
-    pub bids: Vec<(Decimal, Decimal)>,
+    pub asks: Vec<(Price, Quantity)>,
+    pub bids: Vec<(Price, Quantity)>,
     pub last_update_id: String,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
 pub struct DepthMessage {
-    data: DepthEvent,
+    pub data: DepthEvent,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
 pub struct DepthEvent {
-    /// The type of event.
     #[serde(rename(deserialize = "e"))]
     event_type: String,
-    /// The time the event was emitted.
     #[serde(rename(deserialize = "E"))]
     event_time: i64,
-    /// The market symbol.
     #[serde(rename(deserialize = "s"))]
     symbol: String,
-    /// Changes to the depth on the asks side.
     #[serde(rename(deserialize = "a"))]
     pub asks: Vec<(Price, Quantity)>,
-    /// Changes to the depth on the bids side.
     #[serde(rename(deserialize = "b"))]
     pub bids: Vec<(Price, Quantity)>,
-    /// The first id of the aggregated events.
     #[serde(rename(deserialize = "U"))]
     pub first_update_id: u64,
-    /// The last id of the aggregated events.
     #[serde(rename(deserialize = "u"))]
     pub last_update_id: u64,
 }
@@ -70,90 +62,85 @@ pub struct DepthEvent {
 #[tokio::main]
 async fn main() {
     let (stream, _) = connect_async(WSS_URL).await.expect("Failed to connect");
-    let (mut write, read) = stream.split();
+    let (mut write, mut read) = stream.split();
 
     let subscribe_message = serde_json::json!({
         "method": "SUBSCRIBE",
-        "params": [format!("{SYMBOL}@depth")]
+        "params": [format!("{}@depth", SYMBOL)],
+        "id": 1
     })
     .to_string();
 
     write.send(Message::text(subscribe_message)).await.unwrap();
 
-    let order_book = Arc::new(Mutex::new(Orderbook {
+    let order_book = Arc::new(Mutex::new(OrderBook {
         asks: BTreeMap::new(),
         bids: BTreeMap::new(),
         last_update_id: 0,
     }));
     let events = Arc::new(Mutex::new(Vec::new()));
 
-    let read_future = read.for_each(|message| async {
-        let data = message.unwrap().into_data();
-        let Ok(message) = serde_json::from_slice::<DepthMessage>(&data) else {
-            println!("Error parsing message ");
-            return;
-        };
-        events.lock().await.push(message.data);
+    let read_future = tokio::spawn({
+        let events = events.clone();
+
+        async move {
+            while let Some(message) = read.next().await {
+                if let Ok(message) = message {
+                    if let Ok(depth_message) = serde_json::from_slice::<DepthMessage>(&message.into_data()) {
+                        events.lock().await.push(depth_message.data);
+                    } else {
+                        eprintln!("Error parsing depth message");
+                    }
+                } else {
+                    eprintln!("Error receiving message");
+                }
+            }
+        }
     });
 
-    let _= tokio::spawn({
+    let bootstrap_future = tokio::spawn({
         let order_book = order_book.clone();
         let events = events.clone();
 
-        println!("Bootstrapping order book...");
-
         async move {
             loop {
-                std::thread::sleep(std::time::Duration::from_secs(2));
+                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
 
-                let Some(last_ws_update_id) = events
-                    .lock()
-                    .await
-                    .first()
-                    .map(|event| event.last_update_id)
-                 else {
-
-                    continue;
+                let last_ws_update_id = {
+                    let events = events.lock().await;
+                    events.first().map(|event| event.last_update_id)
                 };
 
-                let Ok(request) = request::get(format!("")).await
-                else {
-                    println!("Error fetching order book snapshot");
-                    continue;
-                };
-                let Ok(Snapshot) = request.json::<OrderbookSnapshot>().await else {
-                    println!("Error parsing order book snapshot");
-                    continue;
-                };
-                let Ok(snapshot_last_update_id) = snapshot.last_update_id.parse::<u64>() else {
-                    println!("Error parsing order book snapshot last update id");
-                    continue;
-                };
+                if let Some(last_ws_update_id) = last_ws_update_id {
+                    let response = reqwest::get(format!("{}/depth?symbol={}", API_BASE, SYMBOL)).await;
 
+                    if let Ok(response) = response {
+                        if let Ok(snapshot) = response.json::<OrderBookSnapshot>().await {
+                            if let Ok(snapshot_last_update_id) = snapshot.last_update_id.parse::<u64>() {
+                                if snapshot_last_update_id >= last_ws_update_id {
+                                    let mut events = events.lock().await;
+                                    events.retain(|event| event.last_update_id > snapshot_last_update_id);
 
-                if snapshot_last_update_id >= last_ws_update_id {
-                    events 
-                      .lock()
-                      .await
-                      .retain(|event| event.last_update_id > snapshot_last_update_id);
-                    *order_book.lock().await =Orderbook {
-                       asks: Snapshot
-                          .asks
-                          .into.iter()
-                          .map(|(price, quantity)| (price, quantity))
-                          .collect(),
-                       bids: snapshot
-                           .bids
-                           .into_iter()
-                           .map(|(price, quantity)|(price, quantity))
-                           .collect(),
-                        last_update_id: snapshot_last_update_id;
-                    };
-                    break;
+                                    let mut order_book = order_book.lock().await;
+                                    order_book.asks = snapshot.asks.into_iter().collect();
+                                    order_book.bids = snapshot.bids.into_iter().collect();
+                                    order_book.last_update_id = snapshot_last_update_id;
+
+                                    break;
+                                }
+                            } else {
+                                eprintln!("Error parsing snapshot last update ID");
+                            }
+                        } else {
+                            eprintln!("Error parsing order book snapshot");
+                        }
+                    } else {
+                        eprintln!("Error fetching order book snapshot");
+                    }
                 }
             }
-
-
         }
-    })
+    });
+
+    let _ = tokio::try_join!(read_future, bootstrap_future);
 }
